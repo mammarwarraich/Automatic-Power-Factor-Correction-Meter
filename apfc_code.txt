@@ -1,0 +1,397 @@
+// ============================================================
+//  AUTOMATIC POWER FACTOR CORRECTION (APFC) SYSTEM - CT_116
+//  Target Hardware: Arduino Uno / Compatible
+//  LCD: 16x2 connected via pins A0-A5
+// ============================================================
+
+#include <LiquidCrystal.h>
+
+// --- LCD Pin Mapping (RS, EN, D4, D5, D6, D7) ---
+LiquidCrystal lcd(A5, A4, A3, A2, A1, A0);
+
+// ===================== PIN DEFINITIONS =====================
+
+// Digital INPUTS - Zero Crossing Detectors (ZCD)
+const int voltage = 5;   // Voltage ZCD signal
+const int current  = 6;  // Current ZCD signal
+
+// Digital INPUTS - Manual piano switches (active LOW with internal/external pull-ups)
+const int button1 = 7;   // Manual control: Capacitor Bank 1
+const int button2 = 8;   // Manual control: Capacitor Bank 2
+const int button3 = 9;   // Manual control: Capacitor Bank 3
+const int button4 = 10;  // Manual control: Capacitor Bank 4
+
+// Digital INPUTS - Mode & CL switches
+const int amsw  = 11;  // AUTO/MANUAL select switch (LOW = AUTO, HIGH = MANUAL)
+const int clsw  = 12;  // Correction Load switch (enable/disable relay)
+
+// Digital OUTPUTS
+const int awled   = 13;  // AUTO mode indicator LED
+const int clrelay =  4;  // Correction Load relay output
+
+// Analog OUTPUTS (used as digital) - Capacitor Bank Relays
+const int cap1 = 0;  // Relay for capacitor bank 1 (analog pin 0 = digital 14)
+const int cap2 = 1;  // Relay for capacitor bank 2
+const int cap3 = 2;  // Relay for capacitor bank 3
+const int cap4 = 3;  // Relay for capacitor bank 4
+
+// ==================== GLOBAL VARIABLES =====================
+
+// Raw digital readings
+int tv = 0, tc = 0;         // Voltage and current ZCD readings
+int lag = 0;                 // Raw lag in microseconds (tc - tv)
+int ams = 0, cls = 0;        // Mode switch states
+int b1 = 0, b2 = 0, b3 = 0, b4 = 0; // Button states
+
+// Calculated power factor values
+float ilag  = 0;   // Current lag converted to milliseconds (lag * 0.001)
+float ilead = 0;   // Leading time (10 - ilag) for leading PF case
+float pf    = 0;   // Current power factor = cos(angle in radians)
+float pf1   = 0;   // PF measured BEFORE correction (baseline)
+float pf2   = 0;   // PF measured AFTER correction
+float ipf   = 0;   // Improvement in PF (pf2 - pf1)
+float d     = 0;   // (unused, reserved)
+float angle = 0;   // Phase angle in degrees
+float ar    = 0;   // Phase angle in radians
+
+// ===========================================================
+//  SETUP
+// ===========================================================
+void setup()
+{
+  lcd.begin(16, 2);
+
+  // Configure input pins
+  pinMode(voltage, INPUT);
+  pinMode(current,  INPUT);
+  pinMode(clsw,     INPUT);
+  pinMode(amsw,     INPUT);
+  pinMode(button1,  INPUT);
+  pinMode(button2,  INPUT);
+  pinMode(button3,  INPUT);
+  pinMode(button4,  INPUT);
+
+  // Configure output pins
+  pinMode(cap1,    OUTPUT);
+  pinMode(cap2,    OUTPUT);
+  pinMode(cap3,    OUTPUT);
+  pinMode(cap4,    OUTPUT);
+  pinMode(awled,   OUTPUT);
+  pinMode(clrelay, OUTPUT);
+
+  // Ensure all capacitor banks and relay start OFF
+  digitalWrite(cap1,    LOW);
+  digitalWrite(cap2,    LOW);
+  digitalWrite(cap3,    LOW);
+  digitalWrite(cap4,    LOW);
+  digitalWrite(awled,   LOW);
+  digitalWrite(clrelay, LOW);
+
+  // Startup message
+  lcd.setCursor(0, 0);
+  lcd.print("WELCOME");
+  delay(500);
+  lcd.clear();
+}
+
+// ===========================================================
+//  MAIN LOOP
+// ===========================================================
+void loop()
+{
+  // Read all switch states at start of each cycle
+  tv  = digitalRead(voltage);
+  tc  = digitalRead(current);
+  ams = digitalRead(amsw);
+  cls = digitalRead(clsw);
+
+  // ================================================================
+  //  AUTO MODE  (ams == LOW)
+  //  - LED indicator ON
+  //  - Automatically switches capacitor banks based on measured lag
+  // ================================================================
+  if (ams == 0)
+  {
+    digitalWrite(awled, HIGH);  // Turn on AUTO mode LED
+
+    // ----- PHASE MEASUREMENT via Zero-Crossing Detection -----
+    // Strategy: Timestamp the rising edge of the VOLTAGE zero-crossing,
+    //           then timestamp when the CURRENT zero-crossing rises.
+    //           The difference (tc - tv) gives the time lag in microseconds.
+
+    // Wait for voltage signal to go LOW (falling edge)
+    while (tv == LOW)  { tv = digitalRead(voltage); }
+    // Wait for voltage to go HIGH (rising edge)
+    while (tv == HIGH) { tv = digitalRead(voltage); }
+    // Wait for next LOW (beginning of next half-cycle)
+    while (tv == LOW)  { tv = digitalRead(voltage); }
+
+    tv = micros();  // Capture timestamp at voltage zero-crossing
+
+    // Now wait for the current zero-crossing rising edge
+    while (tc == LOW) { tc = digitalRead(current); }
+    tc = micros();  // Capture timestamp at current zero-crossing
+
+    // Calculate time difference (lag in microseconds)
+    lag = tc - tv;
+
+    // Convert lag to milliseconds
+    ilag = lag * 0.001;
+
+    // Convert lag to phase angle:
+    // At 50 Hz, full cycle = 20 ms → 360°, so 1 ms = 18°
+    angle = ilag * 18;
+
+    // Convert degrees to radians for cos() function
+    ar = angle * 0.0174533;  // π/180 ≈ 0.0174533
+
+    pf = cos(ar);  // Power Factor = cos(phase angle)
+
+    // ----- DISPLAY -----
+    // If ilag < 5ms → genuinely lagging (inductive load)
+    // If ilag >= 5ms → the system has gone past 90° lag and
+    //                   appears as "leading" from the other side
+    //                   (over-corrected), calculate lead time instead.
+    if (ilag < 5)
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("I-LAG=");
+      lcd.setCursor(7, 0);
+      lcd.print(ilag, 3);
+      lcd.print(" msec");
+    }
+    else
+    {
+      ilead = 10 - ilag;  // Infer lead time from remaining half-cycle
+      angle = ilead * 18;
+      ar    = angle * 0.0174533;
+      pf    = cos(ar);
+
+      lcd.setCursor(0, 0);
+      lcd.print("I-LEAD=");
+      lcd.setCursor(7, 0);
+      lcd.print(ilead, 4);
+      lcd.print(" msec");
+    }
+
+    lcd.setCursor(0, 1);
+    lcd.print("PF=");
+    lcd.setCursor(4, 1);
+    lcd.print(pf);
+
+    // ----- AUTO CAPACITOR SWITCHING LOGIC -----
+    // ilag < 1ms  → PF ≈ 0.97 or better  → No correction needed
+    // ilag 1–2ms  → Connect 1 capacitor bank
+    // ilag 2–3ms  → Connect 2 capacitor banks
+    // ilag 3–4ms  → Connect 2 capacitor banks  ← NOTE: same as 2-3ms range
+    // ilag 4–5ms  → Connect 3 capacitor banks
+    // ilag >= 5ms → Over-correction / leading → Disconnect all (avoid cap saturation)
+
+    if (ilag < 1)
+    {
+      digitalWrite(cap1, LOW);
+      digitalWrite(cap2, LOW);
+      digitalWrite(cap3, LOW);
+      digitalWrite(cap4, LOW);
+    }
+    else if (ilag < 2)
+    {
+      digitalWrite(cap1, HIGH);
+      digitalWrite(cap2, LOW);
+      digitalWrite(cap3, LOW);
+      digitalWrite(cap4, LOW);
+    }
+    else if (ilag < 3)
+    {
+      digitalWrite(cap1, HIGH);
+      digitalWrite(cap2, HIGH);
+      digitalWrite(cap3, LOW);
+      digitalWrite(cap4, LOW);
+    }
+    else if (ilag < 4)
+    {
+      // NOTE: 3–4ms range gives same correction as 2–3ms
+      // Consider adding cap3 here for better granularity
+      digitalWrite(cap1, HIGH);
+      digitalWrite(cap2, HIGH);
+      digitalWrite(cap3, LOW);
+      digitalWrite(cap4, LOW);
+    }
+    else if (ilag < 5)
+    {
+      digitalWrite(cap1, HIGH);
+      digitalWrite(cap2, HIGH);
+      digitalWrite(cap3, HIGH);
+      digitalWrite(cap4, LOW);
+    }
+    else
+    {
+      // Leading or over-corrected → disconnect all capacitors
+      digitalWrite(cap1, LOW);
+      digitalWrite(cap2, LOW);
+      digitalWrite(cap3, LOW);
+      digitalWrite(cap4, LOW);
+    }
+
+    // ----- CORRECTION LOAD RELAY -----
+    if (cls == 0)
+    {
+      digitalWrite(clrelay, LOW);   // CL switch OFF → relay open
+    }
+    else
+    {
+      digitalWrite(clrelay, HIGH);  // CL switch ON → relay closed
+    }
+
+    delay(2000);  // Wait 2 seconds between AUTO correction cycles
+
+  } // END AUTO MODE
+
+  // ================================================================
+  //  MANUAL MODE  (ams == HIGH)
+  //  - LED indicator OFF
+  //  - Capacitor banks controlled by individual piano buttons
+  //  - PF is still measured and displayed
+  //  - Optional PF improvement calculation via cls switch
+  // ================================================================
+  else
+  {
+    digitalWrite(awled, LOW);  // Turn off AUTO mode LED
+
+    // ----- PHASE MEASUREMENT (same ZCD method as AUTO mode) -----
+    while (tv == LOW)  { tv = digitalRead(voltage); }
+    while (tv == HIGH) { tv = digitalRead(voltage); }
+    while (tv == LOW)  { tv = digitalRead(voltage); }
+
+    tv = micros();
+
+    while (tc == LOW) { tc = digitalRead(current); }
+    tc = micros();
+
+    lag  = tc - tv;
+    ilag = lag * 0.001;
+    angle = ilag * 18;
+    ar    = angle * 0.0174533;
+    pf    = cos(ar);
+
+    // Recalculate for leading case
+    if (ilag > 5)
+    {
+      ilead = 10 - ilag;
+      angle = ilead * 18;
+      ar    = angle * 0.0174533;
+      pf    = cos(ar);
+    }
+
+    // ----- READ MANUAL BUTTONS -----
+    // Buttons are active LOW (pressed = LOW → capacitor ON)
+    b1 = digitalRead(button1);
+    b2 = digitalRead(button2);
+    b3 = digitalRead(button3);
+    b4 = digitalRead(button4);
+
+    digitalWrite(cap1, (b1 == LOW) ? HIGH : LOW);
+    digitalWrite(cap2, (b2 == LOW) ? HIGH : LOW);
+    digitalWrite(cap3, (b3 == LOW) ? HIGH : LOW);
+    digitalWrite(cap4, (b4 == LOW) ? HIGH : LOW);
+
+    // ----- DISPLAY & PF IMPROVEMENT CALCULATION -----
+    if (ilag < 5)
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("I-LAG=");
+      lcd.setCursor(7, 0);
+      lcd.print(ilag, 3);
+      lcd.print(" msec");
+
+      lcd.setCursor(0, 1);
+      lcd.print("PF=");
+      lcd.setCursor(4, 1);
+      lcd.print(pf);
+
+      // CL switch used to record BEFORE/AFTER PF for improvement display
+      if (cls == 0)
+      {
+        digitalWrite(clrelay, LOW);
+        pf1 = pf;  // Save baseline (uncorrected) PF
+      }
+      else
+      {
+        digitalWrite(clrelay, HIGH);
+        delay(2000);
+
+        pf2 = pf;         // Corrected PF
+        ipf = pf2 - pf1;  // Improvement = corrected - baseline
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+
+        if (pf1 > 0)
+        {
+          lcd.print("IMPROOVED PF=");
+          lcd.setCursor(0, 1);
+          lcd.print(ipf);
+        }
+        else
+        {
+          // Warn user: no baseline was recorded first
+          lcd.print("Please measure PF");
+          lcd.setCursor(0, 1);
+          lcd.print("in lagging mode");
+        }
+      }
+    }
+    else
+    {
+      // Leading case display
+      ilead = 10 - ilag;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("I-LEAD=");
+      lcd.setCursor(7, 0);
+      lcd.print(ilead, 4);
+      lcd.print(" msec");
+
+      lcd.setCursor(0, 1);
+      lcd.print("PF=");
+      lcd.setCursor(4, 1);
+      lcd.print(pf);
+
+      if (cls == 0)
+      {
+        digitalWrite(clrelay, LOW);
+        pf1 = pf;
+      }
+      else
+      {
+        digitalWrite(clrelay, HIGH);
+        delay(2000);
+
+        pf2 = pf;
+        ipf = pf2 - pf1;
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+
+        if (pf1 > 0)
+        {
+          lcd.print("IMPROOVED PF=");
+          lcd.setCursor(0, 1);
+          lcd.print(ipf);
+        }
+        else
+        {
+          lcd.print("Please measure PF");
+          lcd.setCursor(0, 1);
+          lcd.print("in lagging mode");
+        }
+      }
+    }
+
+    delay(2000);  // Wait 2 seconds before next measurement
+
+  } // END MANUAL MODE
+
+} // END loop()

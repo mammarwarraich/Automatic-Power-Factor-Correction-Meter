@@ -7,6 +7,9 @@ A real-time hardware-software integration system designed to optimize energy eff
 Here is the hardware architecture and schematic layout for the system:
 ![Circuit Diagram](circuit.png)
 
+## Embedded Software & Logic
+* The core control logic, sensor sampling algorithms, and relay actuation sequences are written in C++ for the Arduino environment: [Arduino Control Source Code](apfc_code.txt)
+
 ## Key Results & Findings
 * **Power Factor Correction:** Successfully optimized lagging power factors from ~0.72 up to an efficient 0.95.
 * **Response Time:** Automated relay switching executes within milliseconds of inductive load detection.
